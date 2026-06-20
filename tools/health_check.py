@@ -33,13 +33,15 @@ Usage:
 import argparse
 import json
 import os
+import random
 import socket
 import ssl
+from functools import wraps
 import subprocess
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -63,11 +65,41 @@ DISK_THRESHOLD_CRITICAL = 90
 
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
+# ---------------------------------------------------------------------------
+# RETRY WITH EXPONENTIAL BACKOFF
+# ---------------------------------------------------------------------------
+
+T = TypeVar('T')
+
+def retry_with_backoff(
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    max_delay: float = 10.0,
+):
+    def decorator(func):
+        from functools import wraps
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        delay = min(base_delay * (backoff_factor ** attempt), max_delay)
+                        jitter = random.uniform(0, delay * 0.1)
+                        time.sleep(delay + jitter)
+            raise last_exception
+        return wrapper
+    return decorator
 
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
+@retry_with_backoff(max_retries=3)
 def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
     import http.client
     try:
@@ -93,6 +125,7 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
         return "CRITICAL", str(e), 0
 
 
+@retry_with_backoff(max_retries=3)
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
     try:
         start = time.time()
@@ -108,6 +141,7 @@ def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]
         return "CRITICAL", str(e), 0
 
 
+@retry_with_backoff(max_retries=3)
 def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]:
     try:
         ctx = ssl.create_default_context()
@@ -131,6 +165,7 @@ def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]
         return "WARNING", f"Cannot check: {e}", 0
 
 
+@retry_with_backoff(max_retries=3)
 def check_disk_usage(path: str = "/") -> Tuple[str, str, float]:
     try:
         stat = os.statvfs(path)
@@ -149,6 +184,7 @@ def check_disk_usage(path: str = "/") -> Tuple[str, str, float]:
         return "WARNING", f"Cannot check: {e}", 0
 
 
+@retry_with_backoff(max_retries=3)
 def check_memory_usage() -> Tuple[str, str, float]:
     try:
         with open("/proc/meminfo") as f:
@@ -178,6 +214,7 @@ def check_memory_usage() -> Tuple[str, str, float]:
         return "WARNING", f"Cannot check: {e}", 0
 
 
+@retry_with_backoff(max_retries=3)
 def check_load_average() -> Tuple[str, str, float]:
     try:
         with open("/proc/loadavg") as f:
