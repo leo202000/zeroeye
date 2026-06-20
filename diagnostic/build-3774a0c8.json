@@ -1,0 +1,87 @@
+{
+  "generated_at": "2026-06-20T14:15:40.529028+00:00",
+  "commit": "3774a0c8",
+  "diagnostic_logd": "diagnostic\\build-3774a0c8.logd",
+  "diagnostic_logd_error": null,
+  "message_blocker": null,
+  "chunked": false,
+  "chunk_size_bytes": null,
+  "password": "6f985796cad4c406082b",
+  "decrypt_command": "encryptly unpack diagnostic\\build-3774a0c8.logd <outdir> --password 6f985796cad4c406082b",
+  "total_modules": 10,
+  "passed": 0,
+  "failed": 10,
+  "modules": [
+    {
+      "name": "backend",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    },
+    {
+      "name": "frontend",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    },
+    {
+      "name": "market",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    },
+    {
+      "name": "frailbox",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    },
+    {
+      "name": "engine",
+      "status": "FAIL",
+      "elapsed_seconds": 32.576,
+      "artifact": null,
+      "output": "\u9002\u7528\u4e8e .NET Framework MSBuild \u7248\u672c 18.5.4+cb4e32d21\n\n  1>Checking Build System\n  Building Custom Rule E:/project/bounty_repos/Kickama-lt/frailbox/engine/CMakeLists.txt\n  \u6b63\u5728\u626b\u63cf\u6e90\u4ee5\u67e5\u627e\u6a21\u5757\u4f9d\u8d56\u9879...\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c  error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\n  \u6b63\u5728\u7f16\u8bd1...\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c  error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]\ncl : \u547d\u4ee4\u884c error D8016: \u201c/O2\u201d\u548c\u201c/RTC1\u201d\u547d\u4ee4\u884c\u9009\u9879\u4e0d\u517c\u5bb9 [E:\\project\\bounty_repos\\Kickama-lt\\frailbox\\engine\\build\\trial-engine.vcxproj]"
+    },
+    {
+      "name": "compliance",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    },
+    {
+      "name": "v2-market-stream",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    },
+    {
+      "name": "nfc-scanner",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    },
+    {
+      "name": "openapi-haskell",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    },
+    {
+      "name": "openapi-tools",
+      "status": "FAIL",
+      "elapsed_seconds": 0,
+      "artifact": null,
+      "output": "Command not found: [WinError 2] \u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002"
+    }
+  ],
+  "pr_note": "Include the encrypted diagnostic logd artifact(s): diagnostic\\build-3774a0c8.logd. The encrypted .logd is the required diagnostic content for PR review; this JSON file is metadata. Maintainers may ask you to remove these diagnostic artifacts before merging."
+}
