@@ -17,13 +17,50 @@ from typing import Optional
 ROOT = Path(__file__).resolve().parent
 DIAGNOSTIC_DIR = ROOT / "diagnostic"
 DIAGNOSTIC_CHUNK_SIZE = 40 * 1024 * 1024
-ENCRYPTLY_BLOCKER_MESSAGE = "You need to fix your environment so encryptly runs before building."
+ENCRYPTLY_BLOCKER_MESSAGE = "encryptly could not create an archive. You may have timed out; try launching it in the background and waiting for it to finish with no timeout due to a bug in encryptly."
+TEXT_ENCODING = "utf-8"
+
+
+def configure_text_encoding() -> None:
+    """Use UTF-8 consistently for our console and captured child-process text."""
+    os.environ.setdefault("PYTHONIOENCODING", TEXT_ENCODING)
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding=TEXT_ENCODING, errors="replace")
+        except Exception:
+            try:
+                reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
+def subprocess_env(env: Optional[dict[str, str]] = None) -> dict[str, str]:
+    merged = os.environ.copy() if env is None else env.copy()
+    merged.setdefault("PYTHONIOENCODING", TEXT_ENCODING)
+    return merged
+
+
+def run_text_process(cmd: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess with deterministic UTF-8 text decoding."""
+    kwargs.setdefault("text", True)
+    if kwargs.get("text") is not False:
+        kwargs.setdefault("encoding", TEXT_ENCODING)
+        kwargs.setdefault("errors", "replace")
+    if kwargs.get("env") is not None:
+        kwargs["env"] = subprocess_env(kwargs["env"])
+    return subprocess.run(cmd, **kwargs)
+
+
+configure_text_encoding()
 
 
 def current_commit_id() -> str:
     """Return the first 4 bytes (8 hex chars) of HEAD for stable per-commit diagnostics."""
     try:
-        result = subprocess.run(
+        result = run_text_process(
             ["git", "rev-parse", "--verify", "HEAD"],
             cwd=str(ROOT),
             capture_output=True,
@@ -169,6 +206,7 @@ ENCRYPTLY_BINARIES = {
     "linux-x64": ENCRYPTLY_DIR / "linux-x64" / "encryptly",
     "linux-arm64": ENCRYPTLY_DIR / "linux-arm64" / "encryptly",
     "macos-arm64": ENCRYPTLY_DIR / "macos-arm64" / "encryptly",
+    "macos-x64": ENCRYPTLY_DIR / "macos-x64" / "encryptly",
     "windows-x64": ENCRYPTLY_DIR / "windows-x64" / "encryptly.exe",
     "windows-arm64": ENCRYPTLY_DIR / "windows-arm64" / "encryptly.exe",
 }
@@ -222,26 +260,28 @@ def encryptly_platform_help() -> str:
     return f"detected {detected}; available: {available}"
 
 
-def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
+def check_encryptly_runs(timeout: int = 600) -> tuple[bool, str]:
     """Verify encryptly can create a diagnostic bundle before doing any build work."""
     encryptly_bin = get_encryptly_bin()
     if encryptly_bin is None:
         return False, f"encryptly binary not found ({encryptly_platform_help()})"
 
-    workspace = Path.home() / ".cache" / "tent-of-trials" / "encryptly-preflight"
+    workspace = Path(r"E:\project\bounty_repos\Kickama-lt\_cache") / "tent-of-trials" / "encryptly-preflight"
     safe_dir = workspace / "safe"
-    logd_path = workspace / "preflight.logd"
+    output_dir = workspace / "out"
+    logd_path = output_dir / "preflight.logd"
     try:
         shutil.rmtree(workspace, ignore_errors=True)
         safe_dir.mkdir(parents=True, exist_ok=True)
-        (safe_dir / "preflight.txt").write_text("encryptly preflight\n", encoding="utf-8")
-        result = subprocess.run(
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (safe_dir / "preflight.txt").write_text("encryptly preflight, if it fails, increase your timeout\n", encoding="utf-8")
+        result = run_text_process(
             [
                 str(encryptly_bin),
                 "pack",
                 str(logd_path),
                 "--include",
-                str(workspace),
+                str(safe_dir),
                 "--max-file-size",
                 "32000",
             ],
@@ -250,9 +290,9 @@ def check_encryptly_runs(timeout: int = 60) -> tuple[bool, str]:
             text=True,
             timeout=timeout,
         )
-        # if result.returncode != 0:
-        #     output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
-        #     return False, output
+        if result.returncode != 0:
+            output = result.stderr.strip() or result.stdout.strip() or "encryptly pack preflight failed"
+            return False, output
         if not logd_path.exists():
             return False, "encryptly preflight completed without creating a .logd"
         return True, "encryptly preflight passed"
@@ -319,7 +359,7 @@ def build_module(
         if not node_modules.exists():
             print(f"       {color('npm install...', Colors.GRAY)}")
             try:
-                install_result = subprocess.run(
+                install_result = run_text_process(
                     ["npm", "install"],
                     cwd=str(module.dir),
                     capture_output=not verbose,
@@ -331,12 +371,14 @@ def build_module(
                     return False, time.time() - start, f"npm install failed:\n{install_result.stderr}"
             except subprocess.TimeoutExpired:
                 return False, time.time() - start, "npm install TIMEOUT (120s)"
+            except FileNotFoundError as e:
+                return False, 0, f"Command not found: {e}"
 
     if module.name == "engine":
 
         build_type = "Release" if release else "Debug"
         try:
-            cfg_result = subprocess.run(
+            cfg_result = run_text_process(
                 ["cmake", "-S", ".", "-B", "build",
                  f"-DCMAKE_BUILD_TYPE={build_type}"],
                 cwd=str(module.dir),
@@ -370,7 +412,7 @@ def build_module(
             cmd.append("--release")
 
     try:
-        result = subprocess.run(
+        result = run_text_process(
             cmd,
             cwd=str(module.dir),
             capture_output=True,
@@ -399,7 +441,7 @@ def build_module(
 def clean_module(module: Module, verbose: bool = False) -> bool:
     print(f"  {color('▸', Colors.YELLOW)} Cleaning {module.name}...")
     try:
-        subprocess.run(
+        run_text_process(
             module.clean_cmd,
             cwd=str(module.dir),
             capture_output=not verbose,
@@ -429,7 +471,7 @@ def verify_binary(module: Module) -> Optional[str]:
 
 def run_cmd(cmd: list[str], **kwargs) -> tuple[bool, str]:
     try:
-        result = subprocess.run(
+        result = run_text_process(
             cmd, capture_output=True, text=True, check=False, **kwargs
         )
         output = result.stdout
@@ -550,12 +592,12 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         return False
 
     relpaths = [str(path.relative_to(ROOT)) for path in existing]
-    status = subprocess.run(
+    status = run_text_process(
         ["git", "status", "--porcelain", "--", *relpaths],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=300,
     )
     if status.returncode != 0:
         print(f"    {color('✗', Colors.RED)} Could not inspect diagnostic git status: {status.stderr.strip()}")
@@ -564,7 +606,7 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         print(f"    {color('✓', Colors.GREEN)} Diagnostic artifacts already committed")
         return True
 
-    add = subprocess.run(
+    add = run_text_process(
         ["git", "add", "--", *relpaths],
         cwd=str(ROOT),
         capture_output=True,
@@ -575,12 +617,12 @@ def commit_diagnostic_artifacts(paths: list[Path], commit_id: str) -> bool:
         print(f"    {color('✗', Colors.RED)} Could not stage diagnostic artifacts: {add.stderr.strip()}")
         return False
 
-    commit = subprocess.run(
+    commit = run_text_process(
         ["git", "commit", "-m", f"Add build diagnostics for {commit_id}", "--", *relpaths],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=600,
     )
     if commit.returncode != 0:
         output = commit.stderr.strip() or commit.stdout.strip()
@@ -623,7 +665,7 @@ def generate_logd(
 
     # Workspace must live under $HOME because encryptly refuses paths outside home.
     home = Path.home()
-    workspace = home / ".cache" / "tent-of-trials" / "logd-workspace"
+    workspace = Path(r"E:\project\bounty_repos\Kickama-lt\_cache") / "tent-of-trials" / "logd-workspace"
     safe_dir = workspace / "safe"
 
     try:
@@ -665,7 +707,7 @@ def generate_logd(
                 log_lines.append(output)
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
-        sr = subprocess.run(
+        sr = run_text_process(
             [
                 str(encryptly_bin),
                 "pack",
@@ -678,7 +720,7 @@ def generate_logd(
             cwd=str(ROOT),
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=1500,
         )
         if sr.returncode != 0:
             error = sr.stderr.strip() or sr.stdout.strip() or "encryptly pack failed"
