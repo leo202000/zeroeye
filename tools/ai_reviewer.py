@@ -113,6 +113,7 @@ class ReviewSeverity(Enum):
 
     CRITICAL = "critical"
     ERROR = "error"
+    HIGH = "error"  # alias for backward compatibility
     WARNING = "warning"
     INFO = "info"
     SUGGESTION = "suggestion"
@@ -783,6 +784,87 @@ class AiCodeReviewer:
 
 
 # ---------------------------------------------------------------------------
+# SARIF Output
+# ---------------------------------------------------------------------------
+
+SARIF_SEVERITY_MAP = {
+    ReviewSeverity.CRITICAL: "error",
+    ReviewSeverity.ERROR: "error",
+    ReviewSeverity.WARNING: "warning",
+    ReviewSeverity.INFO: "note",
+    ReviewSeverity.SUGGESTION: "note",
+}
+
+SARIF_RULE_PREFIX = "ai-reviewer"
+
+
+def generate_sarif_report(report) -> str:
+    """Generate a SARIF 2.1.0 report from a ProjectReviewReport."""
+    rules = {}
+    results = []
+
+    for file_result in report.file_results:
+        for finding in file_result.findings:
+            rule_id = f"{SARIF_RULE_PREFIX}/{finding.category.value}"
+            if rule_id not in rules:
+                rules[rule_id] = {
+                    "id": rule_id,
+                    "name": finding.category.value,
+                    "shortDescription": {"text": finding.category.value},
+                    "defaultConfiguration": {
+                        "level": SARIF_SEVERITY_MAP.get(finding.severity, "note")
+                    },
+                }
+
+            result_entry = {
+                "ruleId": rule_id,
+                "level": SARIF_SEVERITY_MAP.get(finding.severity, "note"),
+                "message": {"text": finding.message},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {
+                                "uri": finding.file_path,
+                            },
+                            "region": {
+                                "startLine": finding.line_number,
+                            },
+                        }
+                    }
+                ],
+            }
+
+            if finding.suggestion:
+                result_entry["fixes"] = [
+                    {
+                        "description": {"text": finding.suggestion},
+                    }
+                ]
+
+            results.append(result_entry)
+
+    sarif = {
+        "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/cs01/schemas/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "AI Code Reviewer",
+                        "version": "1.0.0",
+                        "informationUri": "https://github.com/lobster-trap/Kickama",
+                        "rules": list(rules.values()),
+                    },
+                },
+                "results": results,
+            }
+        ],
+    }
+
+    return json.dumps(sarif, indent=2, sort_keys=True)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -794,7 +876,9 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--path", type=str, required=True, help="File or directory to review")
     parser.add_argument("--recursive", action="store_true", help="Review directories recursively")
-    parser.add_argument("--output", type=str, default=None, help="Output JSON report path")
+    parser.add_argument("--format", type=str, choices=["text", "json", "sarif"], default="text",
+                        help="Output format: text (default), json, or sarif")
+    parser.add_argument("--output", type=str, default=None, help="Output report path")
     return parser
 
 
@@ -807,6 +891,31 @@ def main() -> int:
 
     if path.is_file():
         result = reviewer.review_file(path)
+
+        if args.format == "sarif":
+            # Wrap single file result in a minimal report structure
+            from dataclasses import dataclass as _dc
+            @_dc
+            class _MiniReport:
+                file_results: list
+            sarif_output = generate_sarif_report(_MiniReport(file_results=[result]))
+            if args.output:
+                Path(args.output).write_text(sarif_output, encoding="utf-8")
+                print(f"SARIF report written to {args.output}")
+            else:
+                print(sarif_output)
+            return 0
+        elif args.format == "json":
+            data = asdict(result)
+            data = json.loads(json.dumps(data, default=str))
+            json_str = json.dumps(data, indent=2, default=str)
+            if args.output:
+                Path(args.output).write_text(json_str, encoding="utf-8")
+                print(f"JSON report written to {args.output}")
+            else:
+                print(json_str)
+            return 0
+
         print(f"\n{'='*60}")
         print(f"AI Code Review: {path}")
         print(f"{'='*60}")
@@ -849,8 +958,15 @@ def main() -> int:
         print(f"  💡 Suggestions: {report.suggestions}")
         print()
 
-        if args.output:
-            reviewer.generate_report_json(report, Path(args.output))
+        if args.format == "sarif":
+            sarif_output = generate_sarif_report(report)
+            if args.output:
+                Path(args.output).write_text(sarif_output, encoding="utf-8")
+                print(f"SARIF report written to {args.output}")
+            else:
+                print(sarif_output)
+        elif args.format == "json" or args.output:
+            reviewer.generate_report_json(report, Path(args.output) if args.output else None)
 
     else:
         logger.error(f"Path not found: {path}")
