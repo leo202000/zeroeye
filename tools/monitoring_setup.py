@@ -78,7 +78,7 @@ RECOMMENDED_ALERT_RULES: List[Dict[str, Any]] = [
     },
     {
         "name": "HighMemoryUsage",
-        "expr": "process_resident_memory_bytes / process_resident_memory_bytes > 0.9",
+        "expr": "process_resident_memory_bytes / machine_memory_bytes > 0.9",
         "duration": "10m",
         "severity": "warning",
         "summary": "High memory usage on {{$labels.instance}}",
@@ -196,6 +196,15 @@ def check_alertmanager(url: str) -> bool:
     print(f"Alertmanager is NOT healthy at {url}")
     return False
 
+
+def validate_alert_expressions(rules):
+    issues=[]
+    for r in rules:
+        expr=r.get("expr","")
+        parts=[p.strip() for p in expr.split("/")]
+        if len(parts)==2 and parts[0]==parts[1]:
+            issues.append(f"Self-dividing expression in alert {r['name']}: {expr}")
+    return issues
 
 def upload_prometheus_rules(rules: List[Dict[str, Any]],
                             prometheus_url: str,
