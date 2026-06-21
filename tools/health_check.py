@@ -32,6 +32,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import socket
 import ssl
@@ -64,6 +65,52 @@ DISK_THRESHOLD_CRITICAL = 90
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
 
+# Retry / circuit-breaker defaults for HTTP probes
+DEFAULT_MAX_RETRIES = 0
+DEFAULT_BACKOFF_FACTOR = 2.0
+DEFAULT_BACKOFF_BASE_DELAY = 0.5
+DEFAULT_CIRCUIT_THRESHOLD = 5
+DEFAULT_CIRCUIT_COOLDOWN = 30.0
+
+logger = logging.getLogger("health_check")
+
+
+class CircuitBreaker:
+    """Track consecutive HTTP probe failures for a service.
+
+    Opens after ``threshold`` consecutive failures and resets to a half-open
+    trial state once ``cooldown`` seconds have elapsed.
+    """
+
+    def __init__(self, threshold: int = DEFAULT_CIRCUIT_THRESHOLD,
+                 cooldown: float = DEFAULT_CIRCUIT_COOLDOWN) -> None:
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.consecutive_failures = 0
+        self.state = "closed"
+        self.opened_at: Optional[float] = None
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
+        if self.state != "closed":
+            self.state = "closed"
+            self.opened_at = None
+
+    def record_failure(self) -> None:
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.threshold and self.state != "open":
+            self.state = "open"
+            self.opened_at = time.time()
+
+    def is_open(self) -> bool:
+        if self.state == "open" and self.opened_at is not None:
+            if (time.time() - self.opened_at) >= self.cooldown:
+                self.state = "half_open"
+                return False
+            return True
+        return False
+
+
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
@@ -91,6 +138,38 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
         return result, detail, status
     except Exception as e:
         return "CRITICAL", str(e), 0
+
+
+def check_http_service_with_retry(host: str, port: int, path: str, timeout: int,
+                                  max_retries: int = DEFAULT_MAX_RETRIES,
+                                  backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+                                  base_delay: float = DEFAULT_BACKOFF_BASE_DELAY,
+                                  breaker: Optional[CircuitBreaker] = None) -> Tuple[str, str, int]:
+    """Probe an HTTP service with exponential backoff retries and circuit breaking.
+
+    The delay before retry attempt N (0-indexed) is
+    ``base_delay * (backoff_factor ** N)``. A non-OK result is retried up to
+    ``max_retries`` times. When a breaker is supplied, successes reset it and
+    failures advance it; an open breaker short-circuits further probes until
+    the cooldown expires.
+    """
+    attempts = max(1, max_retries + 1)
+    last_result: Tuple[str, str, int] = ("CRITICAL", "no attempt made", 0)
+    for attempt in range(attempts):
+        if breaker is not None and breaker.is_open():
+            return "CRITICAL", "Circuit breaker open", 0
+        result, detail, status = check_http_service(host, port, path, timeout)
+        last_result = (result, detail, status)
+        if result == "OK":
+            if breaker is not None:
+                breaker.record_success()
+            return result, detail, status
+        if breaker is not None:
+            breaker.record_failure()
+        if attempt < attempts - 1:
+            delay = base_delay * (backoff_factor ** attempt)
+            time.sleep(delay)
+    return last_result
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
@@ -200,7 +279,12 @@ def check_load_average() -> Tuple[str, str, float]:
 # HEALTH CHECK RUNNER
 # ---------------------------------------------------------------------------
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+def run_health_checks(service: Optional[str] = None, json_output: bool = False,
+                      max_retries: int = DEFAULT_MAX_RETRIES,
+                      backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+                      base_delay: float = DEFAULT_BACKOFF_BASE_DELAY,
+                      circuit_threshold: int = DEFAULT_CIRCUIT_THRESHOLD,
+                      circuit_cooldown: float = DEFAULT_CIRCUIT_COOLDOWN) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
@@ -211,20 +295,42 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     }
 
     all_ok = True
+    breakers: Dict[str, CircuitBreaker] = {}
+    counters = {"total": 0, "ok": 0, "warning": 0, "critical": 0}
+
+    def _tally(status_value: str) -> None:
+        counters["total"] += 1
+        if status_value == "OK":
+            counters["ok"] += 1
+        elif status_value == "WARNING":
+            counters["warning"] += 1
+        else:
+            counters["critical"] += 1
 
     # Check services
     for name, config in SERVICES.items():
         if service and name != service:
             continue
-        status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
+        breaker = None
+        if circuit_threshold > 0:
+            breaker = breakers.get(name)
+            if breaker is None:
+                breaker = CircuitBreaker(circuit_threshold, circuit_cooldown)
+                breakers[name] = breaker
+        status, detail, code = check_http_service_with_retry(
+            config["host"], config["port"], config["path"], config["timeout"],
+            max_retries=max_retries, backoff_factor=backoff_factor,
+            base_delay=base_delay, breaker=breaker,
         )
+        _tally(status)
         results["services"][name] = {
             "status": status,
             "detail": detail,
             "code": code,
             "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
         }
+        if status in ("WARNING", "CRITICAL"):
+            logger.warning("Service '%s' is %s: %s", name, status, detail)
         if status == "CRITICAL":
             all_ok = False
 
@@ -233,27 +339,39 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
         if service and name != service:
             continue
         status, detail, latency = check_tcp_port(config["host"], config["port"], config["timeout"])
+        _tally(status)
         results["infrastructure"][name] = {
             "status": status,
             "detail": detail,
             "endpoint": f"{config['host']}:{config['port']}",
         }
+        if status in ("WARNING", "CRITICAL"):
+            logger.warning("Infrastructure '%s' is %s: %s", name, status, detail)
         if status == "CRITICAL":
             all_ok = False
 
     # Check system resources
     disk_status, disk_detail, disk_pct = check_disk_usage()
+    _tally(disk_status)
     results["system"]["disk"] = {"status": disk_status, "detail": disk_detail}
+    if disk_status in ("WARNING", "CRITICAL"):
+        logger.warning("Disk usage is %s: %s", disk_status, disk_detail)
     if disk_status == "CRITICAL":
         all_ok = False
 
     mem_status, mem_detail, mem_pct = check_memory_usage()
+    _tally(mem_status)
     results["system"]["memory"] = {"status": mem_status, "detail": mem_detail}
+    if mem_status in ("WARNING", "CRITICAL"):
+        logger.warning("Memory usage is %s: %s", mem_status, mem_detail)
     if mem_status == "CRITICAL":
         all_ok = False
 
     load_status, load_detail, load_val = check_load_average()
+    _tally(load_status)
     results["system"]["load"] = {"status": load_status, "detail": load_detail}
+    if load_status in ("WARNING", "CRITICAL"):
+        logger.warning("Load average is %s: %s", load_status, load_detail)
 
     # Check certificate expiry (web services)
     for name, config in SERVICES.items():
@@ -261,14 +379,25 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
             continue
         if config["port"] == 443:
             cert_status, cert_detail, days_left = check_certificate_expiry(config["host"])
+            _tally(cert_status)
             results["services"][name]["certificate"] = {
                 "status": cert_status,
                 "detail": cert_detail,
                 "days_remaining": days_left,
             }
+            if cert_status in ("WARNING", "CRITICAL"):
+                logger.warning("Certificate for '%s' is %s: %s", name, cert_status, cert_detail)
             if cert_status == "CRITICAL":
                 all_ok = False
 
+    circuit_open = any(b.is_open() for b in breakers.values()) if breakers else False
+    results["summary"] = {
+        "total_checks": counters["total"],
+        "ok": counters["ok"],
+        "warning": counters["warning"],
+        "critical": counters["critical"],
+        "circuit_open": circuit_open,
+    }
     results["overall_status"] = "OK" if all_ok else "DEGRADED"
 
     return results
@@ -307,17 +436,41 @@ def parse_args():
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+                        help="Max retry attempts for HTTP probes before giving up (default: 0)")
+    parser.add_argument("--backoff-factor", type=float, default=DEFAULT_BACKOFF_FACTOR,
+                        help="Exponential backoff multiplier between retries (default: 2.0)")
+    parser.add_argument("--backoff-base-delay", type=float, default=DEFAULT_BACKOFF_BASE_DELAY,
+                        help="Base delay in seconds for the first backoff (default: 0.5)")
+    parser.add_argument("--circuit-threshold", type=int, default=DEFAULT_CIRCUIT_THRESHOLD,
+                        help="Consecutive HTTP failures before the circuit opens (default: 5, 0 disables)")
+    parser.add_argument("--circuit-cooldown", type=float, default=DEFAULT_CIRCUIT_COOLDOWN,
+                        help="Seconds before an open circuit resets to half-open (default: 30)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    def _run() -> Dict[str, Any]:
+        return run_health_checks(
+            args.service, args.json,
+            max_retries=args.max_retries,
+            backoff_factor=args.backoff_factor,
+            base_delay=args.backoff_base_delay,
+            circuit_threshold=args.circuit_threshold,
+            circuit_cooldown=args.circuit_cooldown,
+        )
 
     if args.watch:
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
+                results = _run()
                 if args.json:
                     print(json.dumps(results, indent=2))
                 else:
@@ -326,7 +479,7 @@ def main():
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
+        results = _run()
         if args.json:
             output = json.dumps(results, indent=2)
             print(output)
