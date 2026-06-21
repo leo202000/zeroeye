@@ -52,6 +52,23 @@ from collections import defaultdict, Counter
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("log_aggregator")
 
+# Patterns that look like secrets; redacted from parse-error reports so the
+# report never leaks credentials or raw payload fragments.
+_SECRET_PATTERNS = [
+    (re.compile(r"(api[_-]?key|token|password|passwd|secret|auth|bearer|apikey)\s*[:=]\s*\S+", re.IGNORECASE), r"\1=<redacted>"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "<redacted-aws-key>"),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "<redacted-github-token>"),
+    (re.compile(r"Bearer\s+[A-Za-z0-9\-\._~+/=]+"), "Bearer <redacted>"),
+]
+
+
+def _sanitize_text(text: str) -> str:
+    """Redact secret-looking values and clamp length for safe reporting."""
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text[:200]
+
+
 # ---------------------------------------------------------------------------
 # LOG PARSERS
 # ---------------------------------------------------------------------------
@@ -212,20 +229,16 @@ class LogAggregator:
         self.error_patterns: Counter = Counter()
         self.top_errors: Counter = Counter()
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
+        self.parse_errors: List[Dict[str, Any]] = []
 
     def process_file(self, filepath: str) -> int:
         parsed_count = 0
         try:
-            if filepath.endswith('.gz'):
-                with gzip.open(filepath, 'rt', errors='replace') as f:
-                    for line in f:
-                        if self._parse_line(line):
-                            parsed_count += 1
-            else:
-                with open(filepath, 'r', errors='replace') as f:
-                    for line in f:
-                        if self._parse_line(line):
-                            parsed_count += 1
+            opener = gzip.open if filepath.endswith('.gz') else open
+            with opener(filepath, 'rt', errors='replace') as f:
+                for line_number, line in enumerate(f, start=1):
+                    if self._parse_line(line, filepath, line_number):
+                        parsed_count += 1
         except Exception as e:
             logger.error(f"Error processing {filepath}: {e}")
 
@@ -240,7 +253,26 @@ class LogAggregator:
             logger.debug(f"  {filepath.name}: {count} entries")
         return total
 
-    def _parse_line(self, line: str) -> bool:
+    def _record_parse_error(self, filepath: Optional[str], line_number: Optional[int],
+                            parser_type: str, message: str) -> None:
+        self.parse_errors.append({
+            'file': filepath,
+            'line': line_number,
+            'parser': parser_type,
+            'error': _sanitize_text(message),
+        })
+
+    def _parse_line(self, line: str, filepath: Optional[str] = None,
+                    line_number: Optional[int] = None) -> bool:
+        stripped = line.strip()
+        # Lines that look like JSON but fail to parse are recorded as parse
+        # failures; the line still falls through to the text parser so existing
+        # entry counts and outputs stay backward compatible.
+        if stripped and stripped[0] in '{[':
+            try:
+                json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                self._record_parse_error(filepath, line_number, 'json', str(exc))
         for parser in self.parsers:
             entry = parser.parse(line)
             if entry:
@@ -260,6 +292,8 @@ class LogAggregator:
                     self.errors_by_service[service].append(msg)
                     self.error_patterns[msg] += 1
                 return True
+        if stripped:
+            self._record_parse_error(filepath, line_number, 'none', 'no parser matched the line format')
         return False
 
     def get_summary(self) -> Dict[str, Any]:
@@ -359,6 +393,32 @@ class LogAggregator:
             }, f, indent=2, default=str)
         logger.info(f"Report exported to {output_path}")
 
+    def export_parse_error_report(self, output_path: str) -> None:
+        """Write a JSON summary of parse failures grouped by file and line.
+
+        Each failure records the parser type, file path, line number, and a
+        short sanitized error message. Raw log payloads and secret-looking
+        values are never included.
+        """
+        by_file: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for err in self.parse_errors:
+            by_file[err['file'] or '<stdin>'].append({
+                'line': err['line'],
+                'parser': err['parser'],
+                'error': err['error'],
+            })
+        report = {
+            'total_parse_errors': len(self.parse_errors),
+            'errors_by_file': {
+                fname: {'count': len(errs), 'failures': errs}
+                for fname, errs in sorted(by_file.items())
+            },
+        }
+        with open(output_path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        logger.info(f"Parse-error report exported to {output_path} "
+                    f"({len(self.parse_errors)} failures)")
+
     def generate_html_report(self, output_path: str):
         summary = self.get_summary()
         html = f"""<!DOCTYPE html>
@@ -412,6 +472,8 @@ def parse_args():
     parser.add_argument("--format", choices=["json", "csv", "html"], default="json", help="Output format")
     parser.add_argument("--search", help="Search for a string in logs")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--parse-error-report", metavar="PATH",
+                        help="Write a JSON summary of parse failures by file and line to PATH")
     return parser.parse_args()
 
 
@@ -458,6 +520,9 @@ def main():
         aggregator.generate_html_report(args.output)
     else:
         aggregator.export_json(args.output)
+
+    if args.parse_error_report:
+        aggregator.export_parse_error_report(args.parse_error_report)
 
     return 0
 
