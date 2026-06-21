@@ -182,9 +182,9 @@ addResponseInterceptor(<T>(response: ApiResponse<T>): ApiResponse<T> => {
 // Default error interceptor: handles common error patterns
 addErrorInterceptor((error: ApiError): ApiError => {
   if (error.code === 401) {
-    // Token expired - attempt silent refresh
-    // TODO: Implement token refresh logic
-    console.warn('[API] Authentication failed, attempting token refresh...');
+    // Token refresh is handled in request() via a single-flight guard. If we
+    // reach here the refresh already failed, so the caller must re-authenticate.
+    console.warn('[API] Authentication failed after token refresh.');
   }
   if (error.code === 429) {
     console.warn('[API] Rate limit exceeded, retrying with backoff...');
@@ -194,6 +194,139 @@ addErrorInterceptor((error: ApiError): ApiError => {
 
 function generateTraceId(): string {
   return `tot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// ---------------------------------------------------------------------------
+// GUARDED TOKEN REFRESH (single-flight)
+// ---------------------------------------------------------------------------
+//
+// Concurrent 401 responses used to each trigger an independent /auth/refresh
+// request, which could overwrite or clear stored tokens and leave callers with
+// inconsistent auth state. The guard below deduplicates those attempts: all
+// in-flight 401s share a single refresh promise, the original request is
+// retried exactly once on success, and auth state is cleared + a typed error
+// surfaced on failure. The refresh request itself bypasses request() so a
+// 401/403 from /auth/refresh cannot recurse.
+
+const TOKENS_STORAGE_KEY = 'tot_auth_tokens';
+const REFRESH_PATH = '/auth/refresh';
+
+/**
+ * Typed error surfaced when an access token cannot be refreshed. Callers can
+ * distinguish auth failures from other API errors via `instanceof`.
+ */
+export class AuthenticationError extends Error {
+  readonly code = 401;
+  constructor(message = 'Authentication failed: token refresh was unsuccessful.') {
+    super(message);
+    this.name = 'AuthenticationError';
+  }
+}
+
+// Single in-flight refresh promise shared by concurrent 401 responses so only
+// one network refresh runs at a time within this tab.
+let refreshInFlight: Promise<boolean> | null = null;
+
+function readRefreshToken(): string | null {
+  try {
+    const raw = localStorage.getItem(TOKENS_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { refreshToken?: unknown };
+    return typeof parsed.refreshToken === 'string' ? parsed.refreshToken : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistRefreshedTokens(updates: Record<string, unknown>): void {
+  try {
+    const raw = localStorage.getItem(TOKENS_STORAGE_KEY);
+    const existing = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+    const merged = { ...existing, ...updates };
+    localStorage.setItem(TOKENS_STORAGE_KEY, JSON.stringify(merged));
+    if (typeof updates.accessToken === 'string') {
+      // Keep the legacy bearer-token key in sync so the request interceptor
+      // picks up the refreshed credential on the immediate retry.
+      localStorage.setItem('auth_token', updates.accessToken);
+    }
+  } catch {
+    // localStorage may be unavailable (e.g. SSR or restricted environments).
+  }
+}
+
+function clearAuthState(): void {
+  try {
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem(TOKENS_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Run a single-flight token refresh. Concurrent callers share one in-flight
+ * refresh operation. The refresh request is issued with a raw `fetch` (bypassing
+ * `request()`) so a 401/403 from `/auth/refresh` cannot recurse into another
+ * refresh attempt. Returns `true` when new tokens were stored, `false` on any
+ * failure (in which case auth state is cleared).
+ */
+export async function refreshAuthTokens(): Promise<boolean> {
+  if (refreshInFlight) {
+    return refreshInFlight;
+  }
+
+  refreshInFlight = (async (): Promise<boolean> => {
+    const refreshToken = readRefreshToken();
+    if (!refreshToken) {
+      clearAuthState();
+      return false;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}${REFRESH_PATH}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({ refreshToken }),
+      });
+
+      // A 401/403 from the refresh endpoint means the refresh token itself is
+      // invalid. Do not retry - clear auth state and fail.
+      if (!response.ok || response.status === 401 || response.status === 403) {
+        clearAuthState();
+        return false;
+      }
+
+      const body = (await response.json()) as {
+        data?: { tokens?: Record<string, unknown> };
+        tokens?: Record<string, unknown>;
+      } & Record<string, unknown>;
+      const tokens = body?.data?.tokens ?? body?.tokens ?? {};
+      const accessToken = typeof tokens.accessToken === 'string' ? tokens.accessToken : null;
+      if (!accessToken) {
+        clearAuthState();
+        return false;
+      }
+
+      const updates: Record<string, unknown> = { accessToken };
+      if (typeof tokens.refreshToken === 'string') updates.refreshToken = tokens.refreshToken;
+      if (typeof tokens.tokenType === 'string') updates.tokenType = tokens.tokenType;
+      if (typeof tokens.expiresIn === 'number') updates.expiresIn = tokens.expiresIn;
+      persistRefreshedTokens(updates);
+      return true;
+    } catch {
+      clearAuthState();
+      return false;
+    }
+  })();
+
+  try {
+    return await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,30 +344,59 @@ async function request<T>(
   const timeout = config?.timeout ?? DEFAULT_TIMEOUT;
   const maxRetries = config?.retries ?? (method === 'GET' ? MAX_RETRIES : 0);
 
-  let requestConfig: RequestInit & { url: string } = {
-    url,
-    method,
-    headers: {} as Record<string, string>,
-    body: data ? JSON.stringify(data) : undefined,
+  const buildConfig = (): RequestInit & { url: string } => {
+    let cfg: RequestInit & { url: string } = {
+      url,
+      method,
+      headers: {} as Record<string, string>,
+      body: data ? JSON.stringify(data) : undefined,
+    };
+    for (const interceptor of requestInterceptors) {
+      cfg = interceptor(cfg);
+    }
+    return cfg;
   };
 
-  // Apply request interceptors
-  for (const interceptor of requestInterceptors) {
-    requestConfig = interceptor(requestConfig);
-  }
+  const sendOnce = async (cfg: RequestInit & { url: string }): Promise<ApiResponse<T>> => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    cfg.signal = controller.signal;
+    try {
+      const response = await fetch(cfg.url, cfg);
+      return await parseResponse<T>(response);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
 
+  let requestConfig = buildConfig();
   let lastError: Error | null = null;
+  // A refresh is attempted at most once per request() call to prevent loops.
+  let refreshAttempted = false;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeout);
-      requestConfig.signal = controller.signal;
+      let responseData = await sendOnce(requestConfig);
 
-      const response = await fetch(requestConfig.url, requestConfig);
-      clearTimeout(timeoutId);
-
-      const responseData = await parseResponse<T>(response);
+      // Guarded token refresh: a 401 means the access token expired. Dedupe
+      // concurrent refresh attempts through a single in-flight promise, then
+      // retry the original request exactly once with refreshed credentials.
+      if (responseData.status === 401) {
+        if (refreshAttempted) {
+          clearAuthState();
+          throw new AuthenticationError();
+        }
+        refreshAttempted = true;
+        const refreshed = await refreshAuthTokens();
+        if (refreshed) {
+          requestConfig = buildConfig();
+          responseData = await sendOnce(requestConfig);
+        }
+        if (responseData.status === 401) {
+          clearAuthState();
+          throw new AuthenticationError();
+        }
+      }
 
       // Apply response interceptors
       let apiResponse: ApiResponse<T> = responseData;
@@ -244,11 +406,20 @@ async function request<T>(
 
       return apiResponse;
     } catch (error) {
+      if (error instanceof AuthenticationError) {
+        let processed: ApiError = error;
+        for (const interceptor of errorInterceptors) {
+          processed = interceptor(processed);
+        }
+        throw processed;
+      }
+
       lastError = error as Error;
 
       if (attempt < maxRetries && method === 'GET') {
         const delay = RETRY_BASE_DELAY * Math.pow(2, attempt) + Math.random() * 1000;
         await new Promise(resolve => setTimeout(resolve, delay));
+        requestConfig = buildConfig();
         continue;
       }
 
