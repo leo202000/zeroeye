@@ -64,19 +64,84 @@ DISK_THRESHOLD_CRITICAL = 90
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
 
+# Retry / backoff configuration for transient network failures
+RETRY_MAX_ATTEMPTS = int(os.environ.get("HEALTH_CHECK_RETRIES", "3"))
+RETRY_BACKOFF_BASE_SECONDS = float(os.environ.get("HEALTH_CHECK_BACKOFF_BASE", "0.5"))
+RETRY_BACKOFF_FACTOR = float(os.environ.get("HEALTH_CHECK_BACKOFF_FACTOR", "2.0"))
+
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# RETRY / BACKOFF SUPPORT
+# ---------------------------------------------------------------------------
+
+# Network failures that are worth retrying (transient). Deterministic failures
+# such as HTTP 4xx responses or a refused connection during a code freeze are
+# not retried by default.
+TRANSIENT_EXCEPTIONS = (
+    socket.timeout,
+    TimeoutError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    OSError,
+)
+
+
+def is_transient_exception(exc: BaseException) -> bool:
+    """Return True when an exception represents a transient network failure."""
+    if isinstance(exc, TRANSIENT_EXCEPTIONS):
+        return True
+    msg = str(exc).lower()
+    return any(tok in msg for tok in ("timeout", "timed out", "reset by peer", "broken pipe", "temporarily unavailable"))
+
+
+def retry_with_backoff(
+    func,
+    *args,
+    max_attempts: int = RETRY_MAX_ATTEMPTS,
+    backoff_base: float = RETRY_BACKOFF_BASE_SECONDS,
+    backoff_factor: float = RETRY_BACKOFF_FACTOR,
+    retry_on: callable = is_transient_exception,
+    **kwargs,
+):
+    """Call ``func`` with retries and exponential backoff.
+
+    Returns the result of ``func`` on success. On the final failed attempt the
+    last exception is re-raised so the caller can map it to a status. A short
+    sleep (``backoff_base * backoff_factor ** attempt``) is inserted between
+    retries to avoid hammering a recovering service.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_attempts or not retry_on(exc):
+                raise
+            delay = backoff_base * (backoff_factor ** (attempt - 1))
+            time.sleep(delay)
+    # Unreachable: the loop either returns or raises, but keep a safety net.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("retry_with_backoff exhausted without an exception")
+
+
 def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
     import http.client
-    try:
+
+    def _do_check() -> Tuple[str, str, int]:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        conn.request("GET", path)
-        resp = conn.getresponse()
-        status = resp.status
-        body = resp.read().decode("utf-8", errors="replace")[:200]
-        conn.close()
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            status = resp.status
+            body = resp.read().decode("utf-8", errors="replace")[:200]
+        finally:
+            conn.close()
 
         if status == 200:
             result = "OK"
@@ -89,23 +154,88 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
             detail = f"HTTP {status}: {body[:100]}"
 
         return result, detail, status
+
+    try:
+        return retry_with_backoff(_do_check)
     except Exception as e:
         return "CRITICAL", str(e), 0
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
-    try:
+    def _do_check() -> Tuple[str, str, float]:
         start = time.time()
         sock = socket.create_connection((host, port), timeout=timeout)
-        sock.close()
+        try:
+            sock.close()
+        finally:
+            pass
         latency = (time.time() - start) * 1000
         return "OK", f"Connected ({latency:.1f}ms)", latency
+
+    try:
+        return retry_with_backoff(_do_check)
     except socket.timeout:
         return "CRITICAL", f"Connection timeout ({timeout}s)", 0
     except ConnectionRefusedError:
         return "CRITICAL", "Connection refused", 0
     except Exception as e:
+        if is_transient_exception(e):
+            return "CRITICAL", f"Connection failed after retries: {e}", 0
         return "CRITICAL", str(e), 0
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Health check tool")
+    parser.add_argument("--service", "-s", help="Check specific service only")
+    parser.add_argument("--json", "-j", action="store_true", help="JSON output")
+    parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
+    parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
+    parser.add_argument("--retries", type=int, default=RETRY_MAX_ATTEMPTS, help="Max attempts for transient network failures")
+    parser.add_argument("--backoff", type=float, default=RETRY_BACKOFF_BASE_SECONDS, help="Base seconds for exponential backoff between retries")
+    parser.add_argument("--output", "-o", help="Output file path")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Allow CLI override of retry/backoff behaviour
+    global RETRY_MAX_ATTEMPTS, RETRY_BACKOFF_BASE_SECONDS
+    RETRY_MAX_ATTEMPTS = max(1, args.retries)
+    RETRY_BACKOFF_BASE_SECONDS = max(0.0, args.backoff)
+
+    if args.watch:
+        print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
+        try:
+            while True:
+                results = run_health_checks(args.service, args.json)
+                if args.json:
+                    print(json.dumps(results, indent=2))
+                else:
+                    print_health_report(results)
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print("\nMonitoring stopped")
+    else:
+        results = run_health_checks(args.service, args.json)
+        if args.json:
+            output = json.dumps(results, indent=2)
+            print(output)
+        else:
+            print_health_report(results)
+
+        if args.output:
+            with open(args.output, "w") as f:
+                if args.json:
+                    json.dump(results, f, indent=2)
+                else:
+                    json.dump(results, f, indent=2)
+            print(f"Report saved to {args.output}")
+
+        if results["overall_status"] == "DEGRADED":
+            return 1
+
+    return 0
 
 
 def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]:
@@ -300,52 +430,3 @@ def print_health_report(results: Dict[str, Any]):
     print()
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Health check tool")
-    parser.add_argument("--service", "-s", help="Check specific service only")
-    parser.add_argument("--json", "-j", action="store_true", help="JSON output")
-    parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
-    parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
-    parser.add_argument("--output", "-o", help="Output file path")
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    if args.watch:
-        print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
-        try:
-            while True:
-                results = run_health_checks(args.service, args.json)
-                if args.json:
-                    print(json.dumps(results, indent=2))
-                else:
-                    print_health_report(results)
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("\nMonitoring stopped")
-    else:
-        results = run_health_checks(args.service, args.json)
-        if args.json:
-            output = json.dumps(results, indent=2)
-            print(output)
-        else:
-            print_health_report(results)
-
-        if args.output:
-            with open(args.output, "w") as f:
-                if args.json:
-                    json.dump(results, f, indent=2)
-                else:
-                    json.dump(results, f, indent=2)
-            print(f"Report saved to {args.output}")
-
-        if results["overall_status"] == "DEGRADED":
-            return 1
-
-    return 0
-
-
-if __name__ == "__main__":
-    main()
