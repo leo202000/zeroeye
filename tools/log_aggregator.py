@@ -46,11 +46,64 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Counter, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TypedDict
 from collections import defaultdict, Counter
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger("log_aggregator")
+
+# ---------------------------------------------------------------------------
+# TYPE DEFINITIONS
+# ---------------------------------------------------------------------------
+
+class LogEntry(TypedDict):
+    """A parsed log entry produced by a LogParser."""
+
+    timestamp: Optional[int]
+    level: str
+    service: Optional[str]
+    message: str
+    fields: Dict[str, object]
+    format: str
+
+
+class TimeRange(TypedDict):
+    """Span of the earliest to latest log timestamps."""
+
+    start: str
+    end: str
+    duration_hours: float
+
+
+class Summary(TypedDict):
+    """Aggregated statistics returned by LogAggregator.get_summary()."""
+
+    total_entries: int
+    time_range: Optional[TimeRange]
+    by_level: Dict[str, int]
+    by_service: Dict[str, int]
+    by_hour: Dict[str, int]
+    top_errors: Dict[str, int]
+    error_rate: float
+    services_with_errors: Dict[str, int]
+
+
+class ErrorTimelineItem(TypedDict):
+    """A single point in the per-hour error timeline."""
+
+    hour: str
+    count: int
+
+
+class ServiceBreakdown(TypedDict):
+    """Per-service log counts split by level."""
+
+    total: int
+    errors: int
+    warns: int
+    infos: int
+    debugs: int
+
 
 # ---------------------------------------------------------------------------
 # LOG PARSERS
@@ -73,7 +126,7 @@ class LogParser:
         (r'\b(DEBUG|TRACE)\b', 'debug'),
     ]
 
-    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+    def parse(self, line: str) -> Optional[LogEntry]:
         raise NotImplementedError
 
     def extract_timestamp(self, line: str) -> Optional[int]:
@@ -116,7 +169,7 @@ class LogParser:
 class JSONLogParser(LogParser):
     """Parses structured JSON log lines."""
 
-    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+    def parse(self, line: str) -> Optional[LogEntry]:
         try:
             entry = json.loads(line.strip())
             if not isinstance(entry, dict):
@@ -136,7 +189,7 @@ class JSONLogParser(LogParser):
 class TextLogParser(LogParser):
     """Parses plain text log lines."""
 
-    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+    def parse(self, line: str) -> Optional[LogEntry]:
         line = line.strip()
         if not line:
             return None
@@ -166,7 +219,7 @@ class NginxLogParser(LogParser):
         r'"([^"]*)"'
     )
 
-    def parse(self, line: str) -> Optional[Dict[str, Any]]:
+    def parse(self, line: str) -> Optional[LogEntry]:
         match = self.NGINX_PATTERN.match(line)
         if not match:
             return None
@@ -203,14 +256,20 @@ class NginxLogParser(LogParser):
 # ---------------------------------------------------------------------------
 
 class LogAggregator:
-    def __init__(self):
+    """Collects, parses, and aggregates log entries from multiple sources.
+
+    Holds a chain of LogParser implementations, accumulates parsed entries,
+    and exposes summary, timeline, search, and export helpers.
+    """
+
+    def __init__(self) -> None:
         self.parsers = [JSONLogParser(), TextLogParser(), NginxLogParser()]
-        self.entries: List[Dict[str, Any]] = []
-        self.level_counts: Counter = Counter()
-        self.service_counts: Counter = Counter()
-        self.hourly_counts: Counter = Counter()
-        self.error_patterns: Counter = Counter()
-        self.top_errors: Counter = Counter()
+        self.entries: List[LogEntry] = []
+        self.level_counts: Counter[str] = Counter()
+        self.service_counts: Counter[str] = Counter()
+        self.hourly_counts: Counter[str] = Counter()
+        self.error_patterns: Counter[str] = Counter()
+        self.top_errors: Counter[str] = Counter()
         self.errors_by_service: Dict[str, List[str]] = defaultdict(list)
 
     def process_file(self, filepath: str) -> int:
@@ -262,7 +321,7 @@ class LogAggregator:
                 return True
         return False
 
-    def get_summary(self) -> Dict[str, Any]:
+    def get_summary(self) -> Summary:
         return {
             'total_entries': len(self.entries),
             'time_range': self._get_time_range(),
@@ -277,7 +336,7 @@ class LogAggregator:
             },
         }
 
-    def _get_time_range(self) -> Optional[Dict[str, str]]:
+    def _get_time_range(self) -> Optional[TimeRange]:
         timestamps = [
             e['timestamp'] for e in self.entries
             if e.get('timestamp')
@@ -297,8 +356,8 @@ class LogAggregator:
         errors = self.level_counts.get('error', 0) + self.level_counts.get('critical', 0)
         return round(errors / total * 100, 2)
 
-    def get_error_timeline(self) -> List[Dict[str, Any]]:
-        errors_by_hour: Counter = Counter()
+    def get_error_timeline(self) -> List[ErrorTimelineItem]:
+        errors_by_hour: Counter[str] = Counter()
         for entry in self.entries:
             level = entry.get('level', '').lower()
             if level in ('error', 'critical'):
@@ -311,8 +370,8 @@ class LogAggregator:
             for hour, count in sorted(errors_by_hour.items())
         ]
 
-    def get_service_breakdown(self) -> Dict[str, Dict[str, Any]]:
-        breakdown: Dict[str, Dict[str, Any]] = {}
+    def get_service_breakdown(self) -> Dict[str, ServiceBreakdown]:
+        breakdown: Dict[str, ServiceBreakdown] = {}
         for entry in self.entries:
             svc = entry.get('service', 'unknown')
             level = entry.get('level', 'unknown')
@@ -329,9 +388,9 @@ class LogAggregator:
                 breakdown[svc]['debugs'] += 1
         return breakdown
 
-    def search(self, query: str, max_results: int = 100) -> List[Dict[str, Any]]:
+    def search(self, query: str, max_results: int = 100) -> List[LogEntry]:
         query_lower = query.lower()
-        results = []
+        results: List[LogEntry] = []
         for entry in self.entries:
             if len(results) >= max_results:
                 break
@@ -340,7 +399,7 @@ class LogAggregator:
                 results.append(entry)
         return results
 
-    def export_csv(self, output_path: str, max_entries: int = 10000):
+    def export_csv(self, output_path: str, max_entries: int = 10000) -> None:
         fields = ['timestamp', 'level', 'service', 'message']
         with open(output_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
@@ -349,7 +408,7 @@ class LogAggregator:
                 writer.writerow(entry)
         logger.info(f"Exported {min(len(self.entries), max_entries)} entries to {output_path}")
 
-    def export_json(self, output_path: str):
+    def export_json(self, output_path: str) -> None:
         with open(output_path, 'w') as f:
             json.dump({
                 'summary': self.get_summary(),
@@ -359,7 +418,7 @@ class LogAggregator:
             }, f, indent=2, default=str)
         logger.info(f"Report exported to {output_path}")
 
-    def generate_html_report(self, output_path: str):
+    def generate_html_report(self, output_path: str) -> None:
         summary = self.get_summary()
         html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -404,7 +463,7 @@ th {{ background: #1e293b; color: #94a3b8; }}
         logger.info(f"HTML report generated at {output_path}")
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Log aggregator and analysis tool")
     parser.add_argument("--input", "-i", help="Input log file or glob pattern")
     parser.add_argument("--dir", help="Directory containing log files")
@@ -415,7 +474,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main() -> int:
     args = parse_args()
     if args.verbose:
         logger.setLevel(logging.DEBUG)
