@@ -359,6 +359,20 @@ class LogAggregator:
             }, f, indent=2, default=str)
         logger.info(f"Report exported to {output_path}")
 
+    def export_jsonl(self, output_path: str, max_entries: int = 10000):
+        """Export parsed entries as JSON Lines (one JSON object per line).
+
+        Each line is a self-contained JSON object representing a single log
+        entry, making the output suitable for streaming ingestion and
+        line-by-line processing (e.g. by jq or log shipping agents).
+        """
+        exported = 0
+        with open(output_path, "w", encoding="utf-8") as f:
+            for entry in self.entries[:max_entries]:
+                f.write(json.dumps(entry, default=str) + "\n")
+                exported += 1
+        logger.info(f"Exported {exported} entries to {output_path}")
+
     def generate_html_report(self, output_path: str):
         summary = self.get_summary()
         html = f"""<!DOCTYPE html>
@@ -409,7 +423,7 @@ def parse_args():
     parser.add_argument("--input", "-i", help="Input log file or glob pattern")
     parser.add_argument("--dir", help="Directory containing log files")
     parser.add_argument("--output", "-o", default="log_report.json", help="Output file path")
-    parser.add_argument("--format", choices=["json", "csv", "html"], default="json", help="Output format")
+    parser.add_argument("--format", choices=["json", "csv", "html", "jsonl"], default="json", help="Output format")
     parser.add_argument("--search", help="Search for a string in logs")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     return parser.parse_args()
@@ -456,6 +470,8 @@ def main():
         aggregator.export_csv(args.output)
     elif args.format == "html":
         aggregator.generate_html_report(args.output)
+    elif args.format == "jsonl":
+        aggregator.export_jsonl(args.output)
     else:
         aggregator.export_json(args.output)
 
